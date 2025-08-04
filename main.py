@@ -1,4 +1,5 @@
 import uuid
+import tempfile
 import sqlite3
 from sqlite3 import Error
 import gradio as gr
@@ -13,7 +14,6 @@ import markdown
 from bs4 import BeautifulSoup
 import fitz  # PyMuPDF
 import docx
-
 
 # ====== 配置 ======
 dashscope.api_key = "sk-0482b028c90a46b99047ec5f5206df55"
@@ -92,7 +92,7 @@ class ChartQADatabase:
         cursor = self.conn.cursor()
         cursor.execute(
             "SELECT user_id FROM users WHERE username = ? AND password_hash = ?",
-            (username, str(hash(password)))
+            (username, str(hash(password))))
         row = cursor.fetchone()
         return row[0] if row else None
 
@@ -138,8 +138,6 @@ class ChartQADatabase:
 
 # ====== 初始化数据库 ======
 db = ChartQADatabase()
-DEFAULT_USER_ID = db.get_or_create_user("default_user")
-CURRENT_SESSION_ID = db.create_session(DEFAULT_USER_ID, "默认会话")
 
 
 # ====== 工具函数 ======
@@ -148,12 +146,14 @@ def pil_image_to_base64_str(image):
     image.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
+
 def save_uploaded_image(image, session_id):
     image_id = str(uuid.uuid4())
     path = os.path.join(UPLOAD_DIR, f"{image_id}.png")
     image.save(path)
     db.add_image(session_id, path)
     return path
+
 
 def clean_markdown(text):
     html = markdown.markdown(text, output_format='html')
@@ -163,12 +163,14 @@ def clean_markdown(text):
     plain_text = re.sub(r'[ \t]{2,}', ' ', plain_text)
     return plain_text.strip()
 
+
 def convert_history_to_messages(history):
     messages = []
     for q, a in history:
         messages.append({"role": "user", "content": q})
         messages.append({"role": "assistant", "content": a})
     return messages
+
 
 def extract_images_from_pdf(file_path):
     images = []
@@ -182,6 +184,7 @@ def extract_images_from_pdf(file_path):
             images.append(image)
     return images
 
+
 def extract_images_from_docx(file_path):
     images = []
     doc = docx.Document(file_path)
@@ -193,23 +196,25 @@ def extract_images_from_docx(file_path):
             images.append(image)
     return images
 
+
 def handle_uploaded_document(doc_file, session_id):
-    ext = os.path.splitext(doc_file)[-1].lower()  # 注意 doc_file 现在是字符串路径
-    temp_path = doc_file  # 不再需要复制
+    ext = os.path.splitext(doc_file.name)[-1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(doc_file.read())
+        temp_path = tmp.name
 
     if ext == ".pdf":
         images = extract_images_from_pdf(temp_path)
     elif ext == ".docx":
         images = extract_images_from_docx(temp_path)
     else:
-        return f"❌ 不支持的文件类型：{ext}", []
+        return f"\u274c \u4e0d\u652f\u6301\u7684\u6587\u4ef6\u7c7b\u578b: {ext}", []
 
     image_paths = []
     for image in images:
         saved_path = save_uploaded_image(image, session_id)
         image_paths.append(saved_path)
-    return f"成功提取并保存 {len(image_paths)} 张图像", image_paths
-
+    return f"\u6210\u529f\u63d0\u53d6\u5e76\u4fdd\u5b58 {len(image_paths)} \u5f20\u56fe\u50cf", image_paths
 
 
 def answer_with_image(image, question, session_id, history_state):
@@ -235,9 +240,11 @@ def answer_with_image(image, question, session_id, history_state):
         return f"❌ 错误: {str(e)}", history_state
         return f"❌ 错误: 模型输出结构异常：{str(e)}", history_state
 
+
 def get_session_history(session_id):
     history = db.get_session_history(session_id)
     return convert_history_to_messages(history)
+
 
 def create_new_session(session_name):
     global CURRENT_SESSION_ID
@@ -248,6 +255,7 @@ def create_new_session(session_name):
     history = db.get_session_history(CURRENT_SESSION_ID)
     history_as_messages = convert_history_to_messages(history)
     return dropdown_update, history_as_messages
+
 
 def refresh_dropdown():
     return gr.update(
@@ -272,12 +280,12 @@ with gr.Blocks(title="图表问答系统") as demo:
                 login_btn = gr.Button("登录")
                 login_status = gr.Markdown("")
 
-            with gr.Column():
-                gr.Markdown("### 注册")
-                register_username = gr.Textbox(label="用户名")
-                register_password = gr.Textbox(label="密码", type="password")
-                register_btn = gr.Button("注册")
-                register_status = gr.Markdown("")
+                with gr.Column():
+                    gr.Markdown("### 注册")
+                    register_username = gr.Textbox(label="用户名")
+                    register_password = gr.Textbox(label="密码", type="password")
+                    register_btn = gr.Button("注册")
+                    register_status = gr.Markdown("")
 
     # 主界面
     main_interface = gr.Tab("问答系统", visible=False)
@@ -292,11 +300,8 @@ with gr.Blocks(title="图表问答系统") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### 会话管理")
-            session_dropdown = gr.Dropdown(
-                choices=[(session_name, session_id) for session_id, session_name in db.get_user_sessions(DEFAULT_USER_ID)],
-                value=CURRENT_SESSION_ID,
-                label="选择会话"
-            )
+            session_dropdown = gr.Dropdown(label="选择会话")  # choices 和 value 登录成功后动态赋值
+
             new_session_name = gr.Textbox(label="新建会话名", value="新会话")
             create_session_btn = gr.Button(" 创建新会话")
             history_display = gr.Chatbot(label="历史问答", height=300, type="messages")
