@@ -11,6 +11,9 @@ import re
 import os
 import markdown
 from bs4 import BeautifulSoup
+import fitz  # PyMuPDF
+import docx
+
 
 # ====== 配置 ======
 dashscope.api_key = "sk-0482b028c90a46b99047ec5f5206df55"
@@ -135,6 +138,8 @@ class ChartQADatabase:
 
 # ====== 初始化数据库 ======
 db = ChartQADatabase()
+DEFAULT_USER_ID = db.get_or_create_user("default_user")
+CURRENT_SESSION_ID = db.create_session(DEFAULT_USER_ID, "默认会话")
 
 
 # ====== 工具函数 ======
@@ -143,14 +148,12 @@ def pil_image_to_base64_str(image):
     image.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-
 def save_uploaded_image(image, session_id):
     image_id = str(uuid.uuid4())
     path = os.path.join(UPLOAD_DIR, f"{image_id}.png")
     image.save(path)
     db.add_image(session_id, path)
     return path
-
 
 def clean_markdown(text):
     html = markdown.markdown(text, output_format='html')
@@ -160,13 +163,53 @@ def clean_markdown(text):
     plain_text = re.sub(r'[ \t]{2,}', ' ', plain_text)
     return plain_text.strip()
 
-
 def convert_history_to_messages(history):
     messages = []
     for q, a in history:
         messages.append({"role": "user", "content": q})
         messages.append({"role": "assistant", "content": a})
     return messages
+
+def extract_images_from_pdf(file_path):
+    images = []
+    doc = fitz.open(file_path)
+    for i in range(len(doc)):
+        for img in doc.get_page_images(i):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            images.append(image)
+    return images
+
+def extract_images_from_docx(file_path):
+    images = []
+    doc = docx.Document(file_path)
+    for rel in doc.part._rels:
+        rel = doc.part._rels[rel]
+        if "image" in rel.target_ref:
+            image_data = rel.target_part.blob
+            image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            images.append(image)
+    return images
+
+def handle_uploaded_document(doc_file, session_id):
+    ext = os.path.splitext(doc_file)[-1].lower()  # 注意 doc_file 现在是字符串路径
+    temp_path = doc_file  # 不再需要复制
+
+    if ext == ".pdf":
+        images = extract_images_from_pdf(temp_path)
+    elif ext == ".docx":
+        images = extract_images_from_docx(temp_path)
+    else:
+        return f"❌ 不支持的文件类型：{ext}", []
+
+    image_paths = []
+    for image in images:
+        saved_path = save_uploaded_image(image, session_id)
+        image_paths.append(saved_path)
+    return f"成功提取并保存 {len(image_paths)} 张图像", image_paths
+
 
 
 def answer_with_image(image, question, session_id, history_state):
@@ -180,9 +223,7 @@ def answer_with_image(image, question, session_id, history_state):
         img_b64 = pil_image_to_base64_str(image)
         response = MultiModalConversation.call(
             model="qwen-vl-plus",
-            messages=[
-                {"role": "user", "content": [{"image": img_b64}, {"text": question}]}
-            ]
+            messages=[{"role": "user", "content": [{"image": img_b64}, {"text": question}]}]
         )
         answer_text = response["output"]["choices"][0]["message"]["content"]
         cleaned = clean_markdown(answer_text)
@@ -192,6 +233,27 @@ def answer_with_image(image, question, session_id, history_state):
         return cleaned, history_state
     except Exception as e:
         return f"❌ 错误: {str(e)}", history_state
+        return f"❌ 错误: 模型输出结构异常：{str(e)}", history_state
+
+def get_session_history(session_id):
+    history = db.get_session_history(session_id)
+    return convert_history_to_messages(history)
+
+def create_new_session(session_name):
+    global CURRENT_SESSION_ID
+    CURRENT_SESSION_ID = db.create_session(DEFAULT_USER_ID, session_name)
+    sessions = db.get_user_sessions(DEFAULT_USER_ID)
+    session_choices = [(session_name, session_id) for session_id, session_name in sessions]
+    dropdown_update = gr.update(choices=session_choices, value=CURRENT_SESSION_ID)
+    history = db.get_session_history(CURRENT_SESSION_ID)
+    history_as_messages = convert_history_to_messages(history)
+    return dropdown_update, history_as_messages
+
+def refresh_dropdown():
+    return gr.update(
+        choices=[(session_name, session_id) for session_id, session_name in db.get_user_sessions(DEFAULT_USER_ID)],
+        value=CURRENT_SESSION_ID
+    )
 
 
 # ====== Gradio UI ======
@@ -227,7 +289,29 @@ with gr.Blocks(title="图表问答系统") as demo:
                 new_session_name = gr.Textbox(label="新建会话名", value="新会话")
                 create_session_btn = gr.Button("创建新会话")
                 history_display = gr.Chatbot(label="历史问答", height=300, type="messages")
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### 会话管理")
+            session_dropdown = gr.Dropdown(
+                choices=[(session_name, session_id) for session_id, session_name in db.get_user_sessions(DEFAULT_USER_ID)],
+                value=CURRENT_SESSION_ID,
+                label="选择会话"
+            )
+            new_session_name = gr.Textbox(label="新建会话名", value="新会话")
+            create_session_btn = gr.Button(" 创建新会话")
+            history_display = gr.Chatbot(label="历史问答", height=300, type="messages")
 
+        with gr.Column(scale=2):
+            gr.Markdown("### 上传图像并提问")
+            image_input = gr.Image(type="pil", label="上传图表图像")
+            question_input = gr.Textbox(lines=2, label="请输入你的问题")
+            submit_btn = gr.Button("提交")
+            answer_output = gr.Textbox(label="模型回答", interactive=False)
+            current_chat = gr.Chatbot(label="当前会话对话", height=300, type="messages")
+            document_input = gr.File(label="上传 PDF/Word 文档", file_types=[".pdf", ".docx"])
+            extract_status = gr.Textbox(label="提取状态", interactive=False)
+            extract_btn = gr.Button("提取图表图像")
+            extracted_images_display = gr.Gallery(label="提取出的图表图像", columns=3, height=200)
             with gr.Column(scale=2):
                 gr.Markdown("### 上传图像并提问")
                 image_input = gr.Image(type="pil", label="上传图表图像")
@@ -305,7 +389,12 @@ with gr.Blocks(title="图表问答系统") as demo:
         outputs=[history_display]
     )
 
-# ====== 启动服务 ======
+    extract_btn.click(
+        fn=handle_uploaded_document,
+        inputs=[document_input, current_session],
+        outputs=[extract_status, extracted_images_display]
+    )
+
 if __name__ == "__main__":
     try:
         demo.launch(server_name="127.0.0.1", server_port=7860)
