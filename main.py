@@ -171,30 +171,41 @@ def convert_history_to_messages(history):
         messages.append({"role": "assistant", "content": a})
     return messages
 
-
-def extract_images_from_pdf(file_path):
-    images = []
-    doc = fitz.open(file_path)
-    for i in range(len(doc)):
-        for img in doc.get_page_images(i):
+def extract_images_from_pdf(pdf_path, output_dir=UPLOAD_DIR):
+    os.makedirs(output_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    image_paths = []
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        images = page.get_images(full=True)
+        for img_idx, img in enumerate(images):
             xref = img[0]
             base_image = doc.extract_image(xref)
             image_bytes = base_image["image"]
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            images.append(image)
-    return images
+            image_ext = base_image["ext"]
+            image = Image.open(io.BytesIO(image_bytes))
+            image_name = f"{os.path.basename(pdf_path).replace('.', '_')}_p{page_num+1}_img{img_idx+1}.{image_ext}"
+            save_path = os.path.join(output_dir, image_name)
+            image.save(save_path)
+            image_paths.append(save_path)
+    return image_paths
 
 
-def extract_images_from_docx(file_path):
-    images = []
-    doc = docx.Document(file_path)
-    for rel in doc.part._rels:
-        rel = doc.part._rels[rel]
-        if "image" in rel.target_ref:
-            image_data = rel.target_part.blob
-            image = Image.open(io.BytesIO(image_data)).convert("RGB")
-            images.append(image)
-    return images
+def extract_images_from_docx(docx_path, output_dir=UPLOAD_DIR):
+    os.makedirs(output_dir, exist_ok=True)
+    doc = docx.Document(docx_path)
+    rels = doc.part._rels
+    image_paths = []
+    for rel in rels:
+        rel_obj = rels[rel]
+        if "image" in rel_obj.target_ref:
+            img_data = rel_obj.target_part.blob
+            image = Image.open(io.BytesIO(img_data))
+            image_name = f"{os.path.basename(docx_path).replace('.', '_')}_{rel_obj.target_ref.split('/')[-1]}"
+            save_path = os.path.join(output_dir, image_name)
+            image.save(save_path)
+            image_paths.append(save_path)
+    return image_paths
 
 
 def handle_uploaded_document(doc_file, session_id):
@@ -204,17 +215,17 @@ def handle_uploaded_document(doc_file, session_id):
         temp_path = tmp.name
 
     if ext == ".pdf":
-        images = extract_images_from_pdf(temp_path)
+        image_paths = extract_images_from_pdf(temp_path)
     elif ext == ".docx":
-        images = extract_images_from_docx(temp_path)
+        image_paths = extract_images_from_docx(temp_path)
     else:
-        return f"\u274c \u4e0d\u652f\u6301\u7684\u6587\u4ef6\u7c7b\u578b: {ext}", []
+        return f"❌ 不支持的文件类型: {ext}", []
 
-    image_paths = []
-    for image in images:
-        saved_path = save_uploaded_image(image, session_id)
-        image_paths.append(saved_path)
-    return f"\u6210\u529f\u63d0\u53d6\u5e76\u4fdd\u5b58 {len(image_paths)} \u5f20\u56fe\u50cf", image_paths
+    for path in image_paths:
+        db.add_image(session_id, path)
+
+    return f"成功提取并保存 {len(image_paths)} 张图像", image_paths
+
 
 
 def answer_with_image(image, question, session_id, history_state):
@@ -317,13 +328,7 @@ with gr.Blocks(title="图表问答系统") as demo:
             extract_status = gr.Textbox(label="提取状态", interactive=False)
             extract_btn = gr.Button("提取图表图像")
             extracted_images_display = gr.Gallery(label="提取出的图表图像", columns=3, height=200)
-            with gr.Column(scale=2):
-                gr.Markdown("### 上传图像并提问")
-                image_input = gr.Image(type="pil", label="上传图表图像")
-                question_input = gr.Textbox(lines=2, label="请输入你的问题")
-                submit_btn = gr.Button("提交")
-                answer_output = gr.Textbox(label="模型回答", interactive=False)
-                current_chat = gr.Chatbot(label="当前会话对话", height=300, type="messages")
+            
 
 
     # 事件处理
